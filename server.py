@@ -22,7 +22,17 @@ In-App Products:
 - list_inapp_products: List all in-app products
 - batch_create_inapp_products: Create multiple products at once
 - batch_activate_inapp_products: Activate multiple products at once
+
+Subscriptions:
 - list_subscriptions: List all subscription products
+- create_subscription: Create a subscription with base plans
+- update_subscription: Update subscription listings
+- delete_subscription: Delete a subscription (no subscribers only)
+- activate_base_plan: Activate a draft base plan
+- deactivate_base_plan: Deactivate a base plan
+- create_free_trial_offer: Create a free trial offer on a base plan
+- activate_offer: Activate a draft offer
+- deactivate_offer: Deactivate an offer
 """
 
 import json
@@ -70,16 +80,16 @@ def _get_package_name() -> str:
     return package_name
 
 
-def _convert_region_prices(service, package_name: str, price_usd_micros: int) -> dict:
-    """Convert USD price to all regional prices."""
-    units = price_usd_micros // 1_000_000
-    nanos = (price_usd_micros % 1_000_000) * 1000
+def _convert_region_prices(service, package_name: str, price_micros: int, currency_code: str = "USD") -> dict:
+    """Convert a price in any currency to all regional prices."""
+    units = price_micros // 1_000_000
+    nanos = (price_micros % 1_000_000) * 1000
 
     result = service.monetization().convertRegionPrices(
         packageName=package_name,
         body={
             "price": {
-                "currencyCode": "USD",
+                "currencyCode": currency_code,
                 "units": str(units),
                 "nanos": nanos,
             }
@@ -387,11 +397,10 @@ def deploy_production(
 @mcp.tool()
 def create_inapp_product(
     sku: str,
-    title_ko: str,
-    title_en: str,
-    description_ko: str,
-    description_en: str,
-    price_usd: float,
+    localizations: str,
+    price: float,
+    currency_code: str = "USD",
+    purchase_option_id: str = "default",
 ) -> str:
     """Create or update an in-app product (managed product).
 
@@ -402,12 +411,13 @@ def create_inapp_product(
     in an uploaded bundle before products can be created.
 
     Args:
-        sku: Product ID (e.g., "gems_100"). Only lowercase, numbers, underscores.
-        title_ko: Product title in Korean.
-        title_en: Product title in English.
-        description_ko: Product description in Korean.
-        description_en: Product description in English.
-        price_usd: Price in USD (e.g., 0.99 for $0.99).
+        sku: Product ID (e.g., "rezi_until_exam"). Only lowercase, numbers, underscores.
+        localizations: JSON array of localizations. Each entry needs "language", "title", "description".
+            Example: [{"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
+                       {"language": "ro", "title": "Rezidențiat", "description": "Acces complet"}]
+        price: Price amount in the specified currency (e.g., 1670 for 1670 RON).
+        currency_code: ISO currency code (e.g., "RON", "USD", "EUR", "TRY"). Default "USD".
+        purchase_option_id: Purchase option ID. Default "default".
 
     Returns:
         A message indicating success with product details.
@@ -415,22 +425,22 @@ def create_inapp_product(
     service = _get_service()
     package_name = _get_package_name()
 
-    price_micros = int(price_usd * 1_000_000)
+    price_micros = int(price * 1_000_000)
 
     # Convert prices
-    converted = _convert_region_prices(service, package_name, price_micros)
+    converted = _convert_region_prices(service, package_name, price_micros, currency_code)
     regions_version = converted["regionVersion"]["version"]
 
     # Build regional configs
     regional_configs = []
     for region_code, price_data in converted["convertedRegionPrices"].items():
-        price = price_data["price"]
+        p = price_data["price"]
         regional_configs.append({
             "regionCode": region_code,
             "price": {
-                "currencyCode": price["currencyCode"],
-                "units": price.get("units", "0"),
-                "nanos": price.get("nanos", 0),
+                "currencyCode": p["currencyCode"],
+                "units": p.get("units", "0"),
+                "nanos": p.get("nanos", 0),
             },
             "availability": "AVAILABLE",
         })
@@ -439,18 +449,16 @@ def create_inapp_product(
     other = converted.get("convertedOtherRegionsPrice", {})
     new_regions_config = {
         "availability": "AVAILABLE",
-        "usdPrice": other.get("usdPrice", {"currencyCode": "USD", "units": str(int(price_usd)), "nanos": int((price_usd % 1) * 1_000_000_000)}),
-        "eurPrice": other.get("eurPrice", {"currencyCode": "EUR", "units": str(int(price_usd)), "nanos": int((price_usd % 1) * 1_000_000_000)}),
+        "usdPrice": other.get("usdPrice"),
+        "eurPrice": other.get("eurPrice"),
     }
 
-    # Listings
+    # Listings from localizations JSON
+    locales = json.loads(localizations)
     listings = [
-        {"languageCode": "ko-KR", "title": title_ko, "description": description_ko},
-        {"languageCode": "en-US", "title": title_en, "description": description_en},
+        {"languageCode": loc["language"], "title": loc["title"], "description": loc["description"]}
+        for loc in locales
     ]
-
-    # Purchase option ID (no underscores allowed)
-    purchase_option_id = sku.replace("_", "-") + "-default"
 
     body = {
         "packageName": package_name,
@@ -482,26 +490,26 @@ def create_inapp_product(
     return (
         f"Successfully created/updated in-app product.\n"
         f"SKU: {sku}\n"
-        f"Price: ${price_usd:.2f} USD\n"
+        f"Price: {price} {currency_code}\n"
+        f"Localizations: {len(listings)}\n"
         f"Regions: {len(regional_configs)}\n"
         f"Status: Product is in DRAFT state. Use activate_inapp_product to activate."
     )
 
 
 @mcp.tool()
-def activate_inapp_product(sku: str) -> str:
+def activate_inapp_product(sku: str, purchase_option_id: str = "default") -> str:
     """Activate a draft in-app product to make it available for purchase.
 
     Args:
-        sku: Product ID to activate (e.g., "gems_100").
+        sku: Product ID to activate (e.g., "rezi_until_exam").
+        purchase_option_id: Purchase option ID. Default "default".
 
     Returns:
         A message indicating success.
     """
     service = _get_service()
     package_name = _get_package_name()
-
-    purchase_option_id = sku.replace("_", "-") + "-default"
 
     service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
         packageName=package_name,
@@ -521,19 +529,18 @@ def activate_inapp_product(sku: str) -> str:
 
 
 @mcp.tool()
-def deactivate_inapp_product(sku: str) -> str:
+def deactivate_inapp_product(sku: str, purchase_option_id: str = "default") -> str:
     """Deactivate an active in-app product.
 
     Args:
-        sku: Product ID to deactivate (e.g., "gems_100").
+        sku: Product ID to deactivate (e.g., "rezi_until_exam").
+        purchase_option_id: Purchase option ID. Default "default".
 
     Returns:
         A message indicating success.
     """
     service = _get_service()
     package_name = _get_package_name()
-
-    purchase_option_id = sku.replace("_", "-") + "-default"
 
     service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
         packageName=package_name,
@@ -642,6 +649,387 @@ def list_subscriptions() -> str:
 
 
 @mcp.tool()
+def create_subscription(
+    product_id: str,
+    localizations: str,
+    base_plans: str,
+    tax_category: str = "SOFTWARE",
+) -> str:
+    """Create a subscription product with base plans.
+
+    Creates the subscription, its base plans (in DRAFT state), and regional pricing.
+    After creation, use activate_base_plan to make each base plan available.
+
+    Args:
+        product_id: Subscription product ID (e.g., "rezi"). Lowercase, numbers, underscores.
+        localizations: JSON array of listings. Each needs "language", "title", and optionally "benefits" (array of up to 4 strings) and "description" (max 80 chars).
+            Example: [{"language": "en-US", "title": "Rezi", "benefits": ["Full access"]},
+                       {"language": "ro", "title": "Rezidențiat", "benefits": ["Acces complet"]}]
+        base_plans: JSON array of base plan definitions. Each needs:
+            - "id": base plan ID (e.g., "weekly", "monthly")
+            - "period": ISO 8601 duration (P1W, P1M, P3M, P6M, P1Y)
+            - "price": price amount in the specified currency
+            - "currency_code": ISO currency code (e.g., "RON", "EUR", "TRY")
+            - "legacy_compatible" (optional, bool): set true on ONE plan for older billing library compat
+            Example: [{"id": "monthly", "period": "P1M", "price": 210, "currency_code": "RON", "legacy_compatible": true}]
+        tax_category: Tax category. Default "SOFTWARE". Use "SOFTWARE" for digital app sales.
+
+    Returns:
+        A message indicating success with subscription details.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    locales = json.loads(localizations)
+    plans = json.loads(base_plans)
+
+    # Build listings
+    listings = []
+    for loc in locales:
+        listing = {"languageCode": loc["language"], "title": loc["title"]}
+        if "benefits" in loc:
+            listing["benefits"] = loc["benefits"]
+        if "description" in loc:
+            listing["description"] = loc["description"]
+        listings.append(listing)
+
+    # Build base plans with regional pricing
+    base_plan_objects = []
+    regions_version = None
+
+    for plan in plans:
+        price_micros = int(plan["price"] * 1_000_000)
+        currency_code = plan.get("currency_code", "USD")
+
+        converted = _convert_region_prices(service, package_name, price_micros, currency_code)
+        regions_version = converted["regionVersion"]["version"]
+
+        regional_configs = []
+        for region_code, price_data in converted["convertedRegionPrices"].items():
+            p = price_data["price"]
+            regional_configs.append({
+                "regionCode": region_code,
+                "newSubscriberAvailability": True,
+                "price": {
+                    "currencyCode": p["currencyCode"],
+                    "units": p.get("units", "0"),
+                    "nanos": p.get("nanos", 0),
+                },
+            })
+
+        other = converted.get("convertedOtherRegionsPrice", {})
+        other_regions_config = {
+            "usdPrice": other.get("usdPrice"),
+            "eurPrice": other.get("eurPrice"),
+            "newSubscriberAvailability": True,
+        }
+
+        base_plan = {
+            "basePlanId": plan["id"],
+            "regionalConfigs": regional_configs,
+            "otherRegionsConfig": other_regions_config,
+            "autoRenewingBasePlanType": {
+                "billingPeriodDuration": plan["period"],
+                "resubscribeState": "RESUBSCRIBE_STATE_ACTIVE",
+            },
+        }
+
+        if plan.get("legacy_compatible"):
+            base_plan["autoRenewingBasePlanType"]["legacyCompatible"] = True
+
+        base_plan_objects.append(base_plan)
+
+    body = {
+        "packageName": package_name,
+        "productId": product_id,
+        "listings": listings,
+        "basePlans": base_plan_objects,
+        "taxAndComplianceSettings": {
+            "eeaWithdrawalRightType": "EEA_WITHDRAWAL_RIGHT_TYPE_UNSPECIFIED",
+            "taxRateInfoByRegionCode": {},
+        },
+    }
+
+    result = service.monetization().subscriptions().create(
+        packageName=package_name,
+        productId=product_id,
+        body=body,
+        **({f"regionsVersion.version": regions_version} if regions_version else {}),
+    ).execute()
+
+    plan_ids = [p["id"] for p in plans]
+    return (
+        f"Successfully created subscription.\n"
+        f"Product ID: {product_id}\n"
+        f"Listings: {len(listings)}\n"
+        f"Base plans (DRAFT): {', '.join(plan_ids)}\n"
+        f"Use activate_base_plan to activate each base plan."
+    )
+
+
+@mcp.tool()
+def update_subscription(
+    product_id: str,
+    localizations: str = "",
+    tax_category: str = "",
+) -> str:
+    """Update an existing subscription's listings or settings.
+
+    Args:
+        product_id: Subscription product ID (e.g., "rezi").
+        localizations: JSON array of listings to update (same format as create_subscription). Leave empty to skip.
+        tax_category: Tax category to set. Leave empty to skip.
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    update_fields = []
+    body = {
+        "packageName": package_name,
+        "productId": product_id,
+    }
+
+    if localizations:
+        locales = json.loads(localizations)
+        listings = []
+        for loc in locales:
+            listing = {"languageCode": loc["language"], "title": loc["title"]}
+            if "benefits" in loc:
+                listing["benefits"] = loc["benefits"]
+            if "description" in loc:
+                listing["description"] = loc["description"]
+            listings.append(listing)
+        body["listings"] = listings
+        update_fields.append("listings")
+
+    if not update_fields:
+        return "Nothing to update. Provide localizations to update."
+
+    # Get regions version
+    converted = _convert_region_prices(service, package_name, 1_000_000, "USD")
+    regions_version = converted["regionVersion"]["version"]
+
+    result = service.monetization().subscriptions().patch(
+        packageName=package_name,
+        productId=product_id,
+        body=body,
+        updateMask=",".join(update_fields),
+        **({f"regionsVersion.version": regions_version}),
+    ).execute()
+
+    return (
+        f"Successfully updated subscription '{product_id}'.\n"
+        f"Updated fields: {', '.join(update_fields)}"
+    )
+
+
+@mcp.tool()
+def delete_subscription(product_id: str) -> str:
+    """Delete a subscription product.
+
+    WARNING: This permanently deletes the subscription. Only works if the subscription
+    has never had any subscribers. Once a subscription has had subscribers, it cannot
+    be deleted — only archived/deactivated.
+
+    Args:
+        product_id: Subscription product ID to delete (e.g., "rezi").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    service.monetization().subscriptions().delete(
+        packageName=package_name,
+        productId=product_id,
+    ).execute()
+
+    return f"Successfully deleted subscription: {product_id}"
+
+
+@mcp.tool()
+def activate_base_plan(product_id: str, base_plan_id: str) -> str:
+    """Activate a draft base plan to make it available for new subscribers.
+
+    Args:
+        product_id: Parent subscription product ID (e.g., "rezi").
+        base_plan_id: Base plan ID to activate (e.g., "monthly", "weekly").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    service.monetization().subscriptions().basePlans().activate(
+        packageName=package_name,
+        productId=product_id,
+        basePlanId=base_plan_id,
+        body={},
+    ).execute()
+
+    return f"Successfully activated base plan '{base_plan_id}' on subscription '{product_id}'."
+
+
+@mcp.tool()
+def deactivate_base_plan(product_id: str, base_plan_id: str) -> str:
+    """Deactivate a base plan so it's no longer available to new subscribers.
+
+    Existing subscribers keep their plan until it expires.
+
+    Args:
+        product_id: Parent subscription product ID (e.g., "rezi").
+        base_plan_id: Base plan ID to deactivate (e.g., "monthly").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    service.monetization().subscriptions().basePlans().deactivate(
+        packageName=package_name,
+        productId=product_id,
+        basePlanId=base_plan_id,
+        body={},
+    ).execute()
+
+    return f"Successfully deactivated base plan '{base_plan_id}' on subscription '{product_id}'."
+
+
+@mcp.tool()
+def create_free_trial_offer(
+    product_id: str,
+    base_plan_id: str,
+    offer_id: str,
+    free_trial_duration: str,
+) -> str:
+    """Create a free trial offer on a base plan.
+
+    Creates the offer in DRAFT state. Use activate_offer to make it live.
+
+    Args:
+        product_id: Parent subscription product ID (e.g., "rezi").
+        base_plan_id: Base plan ID to attach the offer to (e.g., "monthly").
+        offer_id: Unique offer ID (e.g., "monthly-free-trial").
+        free_trial_duration: ISO 8601 duration for the free trial (e.g., "P3D" for 3 days, "P7D" for 7 days).
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    # Get regions version
+    converted = _convert_region_prices(service, package_name, 1_000_000, "USD")
+    regions_version = converted["regionVersion"]["version"]
+
+    # Build regional configs — make available in all regions
+    regional_configs = []
+    for region_code in converted["convertedRegionPrices"]:
+        regional_configs.append({
+            "regionCode": region_code,
+            "newSubscriberAvailability": True,
+        })
+
+    body = {
+        "packageName": package_name,
+        "productId": product_id,
+        "basePlanId": base_plan_id,
+        "offerId": offer_id,
+        "phases": [{
+            "duration": free_trial_duration,
+            "recurrenceCount": 1,
+            "regionalConfigs": [
+                {"regionCode": rc["regionCode"], "free": {}}
+                for rc in regional_configs
+            ],
+            "otherRegionsConfig": {"otherRegionsNewSubscriberAvailability": True, "free": {}},
+        }],
+        "targeting": {
+            "acquisitionRule": {
+                "scope": {"thisSubscription": {}},
+            },
+        },
+        "regionalConfigs": regional_configs,
+        "otherRegionsConfig": {"otherRegionsNewSubscriberAvailability": True},
+    }
+
+    result = service.monetization().subscriptions().basePlans().offers().create(
+        packageName=package_name,
+        productId=product_id,
+        basePlanId=base_plan_id,
+        offerId=offer_id,
+        body=body,
+        **({f"regionsVersion.version": regions_version}),
+    ).execute()
+
+    return (
+        f"Successfully created free trial offer.\n"
+        f"Subscription: {product_id}, Base plan: {base_plan_id}\n"
+        f"Offer ID: {offer_id}, Duration: {free_trial_duration}\n"
+        f"Eligibility: Never had this subscription\n"
+        f"Status: DRAFT — use activate_offer to make it live."
+    )
+
+
+@mcp.tool()
+def activate_offer(product_id: str, base_plan_id: str, offer_id: str) -> str:
+    """Activate a draft subscription offer.
+
+    Args:
+        product_id: Parent subscription product ID (e.g., "rezi").
+        base_plan_id: Base plan ID (e.g., "monthly").
+        offer_id: Offer ID to activate (e.g., "monthly-free-trial").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    service.monetization().subscriptions().basePlans().offers().activate(
+        packageName=package_name,
+        productId=product_id,
+        basePlanId=base_plan_id,
+        offerId=offer_id,
+        body={},
+    ).execute()
+
+    return f"Successfully activated offer '{offer_id}' on {product_id}/{base_plan_id}."
+
+
+@mcp.tool()
+def deactivate_offer(product_id: str, base_plan_id: str, offer_id: str) -> str:
+    """Deactivate a subscription offer.
+
+    Args:
+        product_id: Parent subscription product ID (e.g., "rezi").
+        base_plan_id: Base plan ID (e.g., "monthly").
+        offer_id: Offer ID to deactivate (e.g., "monthly-free-trial").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    service.monetization().subscriptions().basePlans().offers().deactivate(
+        packageName=package_name,
+        productId=product_id,
+        basePlanId=base_plan_id,
+        offerId=offer_id,
+        body={},
+    ).execute()
+
+    return f"Successfully deactivated offer '{offer_id}' on {product_id}/{base_plan_id}."
+
+
+@mcp.tool()
 def get_app_info() -> str:
     """Get basic app information from Google Play.
 
@@ -691,8 +1079,8 @@ def get_app_info() -> str:
 def batch_create_inapp_products(products_json: str) -> str:
     """Create multiple in-app products from a JSON array.
 
-    Each product in the array should have: sku, title_ko, title_en,
-    description_ko, description_en, price_usd.
+    Each product in the array should have: sku, localizations, price, currency_code.
+    Optionally: purchase_option_id (default: "default").
 
     IMPORTANT: The app must have BILLING permission and Play Billing Library
     in an uploaded bundle before products can be created.
@@ -700,9 +1088,11 @@ def batch_create_inapp_products(products_json: str) -> str:
     Args:
         products_json: JSON array of product definitions.
             Example: [
-              {"sku": "gems_12", "title_ko": "보석 12개", "title_en": "12 Gems",
-               "description_ko": "보석 12개", "description_en": "Get 12 gems",
-               "price_usd": 0.99},
+              {"sku": "rezi_until_exam", "price": 1670, "currency_code": "RON",
+               "localizations": [
+                 {"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
+                 {"language": "ro", "title": "Rezidențiat", "description": "Acces complet"}
+               ]},
               ...
             ]
 
@@ -714,26 +1104,26 @@ def batch_create_inapp_products(products_json: str) -> str:
 
     for i, product in enumerate(products, 1):
         try:
-            # Call the single product creation function directly
             service = _get_service()
             package_name = _get_package_name()
 
             sku = product["sku"]
-            price_usd = product["price_usd"]
-            price_micros = int(price_usd * 1_000_000)
+            prod_price = product["price"]
+            prod_currency = product.get("currency_code", "USD")
+            price_micros = int(prod_price * 1_000_000)
 
-            converted = _convert_region_prices(service, package_name, price_micros)
+            converted = _convert_region_prices(service, package_name, price_micros, prod_currency)
             regions_version = converted["regionVersion"]["version"]
 
             regional_configs = []
             for region_code, price_data in converted["convertedRegionPrices"].items():
-                price = price_data["price"]
+                p = price_data["price"]
                 regional_configs.append({
                     "regionCode": region_code,
                     "price": {
-                        "currencyCode": price["currencyCode"],
-                        "units": price.get("units", "0"),
-                        "nanos": price.get("nanos", 0),
+                        "currencyCode": p["currencyCode"],
+                        "units": p.get("units", "0"),
+                        "nanos": p.get("nanos", 0),
                     },
                     "availability": "AVAILABLE",
                 })
@@ -746,18 +1136,18 @@ def batch_create_inapp_products(products_json: str) -> str:
             }
 
             listings = [
-                {"languageCode": "ko-KR", "title": product["title_ko"], "description": product["description_ko"]},
-                {"languageCode": "en-US", "title": product["title_en"], "description": product["description_en"]},
+                {"languageCode": loc["language"], "title": loc["title"], "description": loc["description"]}
+                for loc in product["localizations"]
             ]
 
-            purchase_option_id = sku.replace("_", "-") + "-default"
+            opt_id = product.get("purchase_option_id", "default")
 
             body = {
                 "packageName": package_name,
                 "productId": sku,
                 "listings": listings,
                 "purchaseOptions": [{
-                    "purchaseOptionId": purchase_option_id,
+                    "purchaseOptionId": opt_id,
                     "buyOption": {"legacyCompatible": True},
                     "regionalPricingAndAvailabilityConfigs": regional_configs,
                     "newRegionsConfig": new_regions_config,
@@ -775,7 +1165,7 @@ def batch_create_inapp_products(products_json: str) -> str:
             request.uri += f"{sep}regionsVersion.version={regions_version}"
             request.execute()
 
-            results.append(f"[{i}/{len(products)}] OK: {sku} (${price_usd:.2f})")
+            results.append(f"[{i}/{len(products)}] OK: {sku} ({prod_price} {prod_currency})")
 
         except Exception as e:
             results.append(f"[{i}/{len(products)}] FAIL: {product.get('sku', 'unknown')} - {e}")
@@ -1235,7 +1625,7 @@ def batch_activate_inapp_products(skus_json: str) -> str:
 
     for i, sku in enumerate(skus, 1):
         try:
-            purchase_option_id = sku.replace("_", "-") + "-default"
+            purchase_option_id = "default"
 
             service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
                 packageName=package_name,
