@@ -1,42 +1,46 @@
 """Google Play Developer API MCP Server.
 
-Provides tools for managing Google Play app deployment, store listings, and in-app products:
+Provides tools for managing Google Play app deployment, store listings,
+in-app products, and subscriptions.
 
 Deployment:
 - deploy_internal: Upload AAB and deploy to internal testing track
+- deploy_track: Upload AAB and deploy to any track
+- deploy_production: Upload AAB and deploy to production (requires confirmation)
 - get_app_info: Get app track information
 
 Store Listing:
-- get_store_listing: Get current store listing (title, descriptions)
+- get_store_listing: Get current store listing
 - update_store_listing: Update store listing text
-- upload_store_image: Upload a single image (icon, feature graphic, screenshot)
-- batch_upload_store_images: Upload all images from a directory in one edit
+- upload_store_image: Upload a single image
+- batch_upload_store_images: Upload all images from a directory
 - list_store_images: List uploaded images
 - delete_store_image: Delete a single image
 - delete_all_store_images: Delete all images of a given type
 
 In-App Products:
-- create_inapp_product: Create or update an in-app product
-- activate_inapp_product: Activate a draft in-app product
-- deactivate_inapp_product: Deactivate an in-app product
-- list_inapp_products: List all in-app products
+- create_inapp_product: Create or update a one-time product
+- activate_inapp_product: Activate a draft product
+- deactivate_inapp_product: Deactivate a product
+- list_inapp_products: List all one-time products
 - batch_create_inapp_products: Create multiple products at once
 - batch_activate_inapp_products: Activate multiple products at once
 
 Subscriptions:
-- list_subscriptions: List all subscription products
+- list_subscriptions: List all subscriptions
 - create_subscription: Create a subscription with base plans
 - update_subscription: Update subscription listings
-- delete_subscription: Delete a subscription (no subscribers only)
+- delete_subscription: Delete a subscription
 - activate_base_plan: Activate a draft base plan
 - deactivate_base_plan: Deactivate a base plan
-- create_free_trial_offer: Create a free trial offer on a base plan
+- create_free_trial_offer: Create a free trial offer
 - activate_offer: Activate a draft offer
 - deactivate_offer: Deactivate an offer
 """
 
 import json
 import os
+from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -50,6 +54,11 @@ load_dotenv(Path(__file__).parent / ".env")
 mcp = FastMCP("google-play")
 
 SCOPES = ["https://www.googleapis.com/auth/androidpublisher"]
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
 
 
 def _get_service():
@@ -80,10 +89,66 @@ def _get_package_name() -> str:
     return package_name
 
 
-def _convert_region_prices(service, package_name: str, price_micros: int, currency_code: str = "USD") -> dict:
-    """Convert a price in any currency to all regional prices."""
-    units = price_micros // 1_000_000
-    nanos = (price_micros % 1_000_000) * 1000
+# ---------------------------------------------------------------------------
+# Pricing helpers
+# ---------------------------------------------------------------------------
+
+# Google Play regional price caps (whole currency units).
+# The API rejects prices above these. Add more as discovered from API errors.
+_REGION_MAX_PRICE_UNITS = {
+    "KR": 570_000,       # KRW ₩570,000
+    "CL": 350_000,       # CLP 350,000
+    "VN": 12_500_000,    # VND ₫12,500,000
+}
+
+# Map currency codes to their primary region code (for price verification).
+_CURRENCY_TO_REGION = {
+    "RON": "RO", "EUR": "DE", "USD": "US", "TRY": "TR", "GBP": "GB",
+    "PHP": "PH", "INR": "IN", "ARS": "AR", "BRL": "BR", "JPY": "JP",
+    "KRW": "KR", "PLN": "PL", "CZK": "CZ", "HUF": "HU", "SEK": "SE",
+    "NOK": "NO", "DKK": "DK", "CHF": "CH", "CAD": "CA", "AUD": "AU",
+    "MXN": "MX", "CLP": "CL", "COP": "CO", "PEN": "PE", "EGP": "EG",
+    "ZAR": "ZA", "NGN": "NG", "SAR": "SA", "AED": "AE", "ILS": "IL",
+    "TWD": "TW", "HKD": "HK", "SGD": "SG", "MYR": "MY", "THB": "TH",
+    "IDR": "ID", "VND": "VN", "UAH": "UA", "BGN": "BG", "HRK": "HR",
+}
+
+
+def _price_to_units_nanos(price: float) -> tuple[int, int]:
+    """Convert a decimal price to (units, nanos) using Decimal for precision."""
+    d = Decimal(str(price))
+    units = int(d)
+    nanos = int((d - units) * 1_000_000_000)
+    return units, nanos
+
+
+def _format_money(price_obj: dict) -> str:
+    """Format a Google Money object as a human-readable string."""
+    if not price_obj:
+        return "N/A"
+    units = int(price_obj.get("units", "0"))
+    nanos = price_obj.get("nanos", 0)
+    currency = price_obj.get("currencyCode", "???")
+    if nanos == 0:
+        return f"{units:,} {currency}"
+    value = units + nanos / 1_000_000_000
+    return f"{value:,.2f} {currency}"
+
+
+def _cap_price(region_code: str, units: int, nanos: int) -> tuple[int, int, bool]:
+    """Cap price at regional maximum if exceeded. Returns (units, nanos, was_capped)."""
+    max_units = _REGION_MAX_PRICE_UNITS.get(region_code)
+    if max_units is not None and units > max_units:
+        return max_units, 0, True
+    return units, nanos, False
+
+
+def _convert_prices(service, package_name: str, price: float, currency_code: str) -> dict:
+    """Convert a price to all regions via the Google Play API.
+
+    Returns dict with 'regionsVersion' and 'convertedRegionPrices'.
+    """
+    units, nanos = _price_to_units_nanos(price)
 
     result = service.monetization().convertRegionPrices(
         packageName=package_name,
@@ -96,17 +161,116 @@ def _convert_region_prices(service, package_name: str, price_micros: int, curren
         },
     ).execute()
 
-    return result
+    return {
+        "regionsVersion": result["regionVersion"]["version"],
+        "convertedRegionPrices": result.get("convertedRegionPrices", {}),
+    }
+
+
+def _build_regional_configs(converted_prices: dict) -> tuple[list, list[str]]:
+    """Build one-time product regional pricing configs with capping.
+
+    Returns (regional_configs, cap_warnings).
+    """
+    regional_configs = []
+    cap_warnings = []
+
+    for region_code, price_data in converted_prices.items():
+        p = price_data["price"]
+        units = int(p.get("units", "0"))
+        nanos = p.get("nanos", 0)
+
+        units, nanos, was_capped = _cap_price(region_code, units, nanos)
+        if was_capped:
+            cap_warnings.append(
+                f"  {region_code}: capped to {units:,} {p['currencyCode']} "
+                f"(limit: {_REGION_MAX_PRICE_UNITS[region_code]:,})"
+            )
+
+        regional_configs.append({
+            "regionCode": region_code,
+            "price": {
+                "currencyCode": p["currencyCode"],
+                "units": str(units),
+                "nanos": nanos,
+            },
+            "availability": "AVAILABLE",
+        })
+
+    return regional_configs, cap_warnings
+
+
+def _build_subscription_regional_configs(converted_prices: dict) -> tuple[list, list[str]]:
+    """Build subscription regional pricing configs with capping.
+
+    Returns (regional_configs, cap_warnings).
+    """
+    regional_configs = []
+    cap_warnings = []
+
+    for region_code, price_data in converted_prices.items():
+        p = price_data["price"]
+        units = int(p.get("units", "0"))
+        nanos = p.get("nanos", 0)
+
+        units, nanos, was_capped = _cap_price(region_code, units, nanos)
+        if was_capped:
+            cap_warnings.append(
+                f"  {region_code}: capped to {units:,} {p['currencyCode']} "
+                f"(limit: {_REGION_MAX_PRICE_UNITS[region_code]:,})"
+            )
+
+        regional_configs.append({
+            "regionCode": region_code,
+            "newSubscriberAvailability": True,
+            "price": {
+                "currencyCode": p["currencyCode"],
+                "units": str(units),
+                "nanos": nanos,
+            },
+        })
+
+    return regional_configs, cap_warnings
+
+
+def _extract_verification_prices(result: dict, target_region: str | None) -> str:
+    """Extract key prices from one-time product API result for verification."""
+    lines = []
+    for opt in result.get("purchaseOptions", []):
+        for cfg in opt.get("regionalPricingAndAvailabilityConfigs", []):
+            region = cfg.get("regionCode", "")
+            price_str = _format_money(cfg.get("price", {}))
+            if region == target_region:
+                lines.insert(0, f"  {region} (target): {price_str}")
+            elif region == "US":
+                lines.append(f"  US: {price_str}")
+            elif region == "DE":
+                lines.append(f"  DE (EUR): {price_str}")
+    return "\n".join(lines[:5])
+
+
+def _extract_subscription_verification(result: dict, target_region: str | None) -> str:
+    """Extract key prices from subscription API result for verification."""
+    lines = []
+    for plan in result.get("basePlans", []):
+        plan_id = plan.get("basePlanId", "?")
+        for cfg in plan.get("regionalConfigs", []):
+            region = cfg.get("regionCode", "")
+            price_str = _format_money(cfg.get("price", {}))
+            if region == target_region:
+                lines.append(f"  {plan_id} / {region} (target): {price_str}")
+            elif region == "US":
+                lines.append(f"  {plan_id} / US: {price_str}")
+    return "\n".join(lines[:10])
+
+
+# ---------------------------------------------------------------------------
+# Edit helpers (for deployment/store listing)
+# ---------------------------------------------------------------------------
 
 
 def _commit_edit(service, package_name: str, edit_id: str):
-    """Commit an edit, handling draft apps that require a track update.
-
-    Draft apps on Google Play require a track release with status "draft"
-    to be present in the same edit when committing. This function always
-    re-applies the internal track with draft status before committing.
-    """
-    # For draft apps: always re-apply internal track with draft status
+    """Commit an edit, handling draft apps that require a track update."""
     track = service.edits().tracks().get(
         packageName=package_name,
         editId=edit_id,
@@ -115,7 +279,6 @@ def _commit_edit(service, package_name: str, edit_id: str):
 
     releases = track.get("releases", [])
     if releases:
-        # Only keep the latest release as draft (API allows only one draft)
         latest = releases[0]
         latest["status"] = "draft"
         releases = [latest]
@@ -129,26 +292,27 @@ def _commit_edit(service, package_name: str, edit_id: str):
         body={"track": "internal", "releases": releases},
     ).execute()
 
-    # Now commit with the track update included
     service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# Deployment tools
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def deploy_internal(
     aab_path: str,
-    release_notes_ko: str = "",
     release_notes_en: str = "",
+    release_notes_ko: str = "",
     status: str = "draft",
 ) -> str:
     """Deploy an Android App Bundle to the internal testing track.
 
-    IMPORTANT: This will upload your app bundle to Google Play.
-    Make sure you have the correct bundle file before proceeding.
-
     Args:
         aab_path: Path to the .aab file to upload.
-        release_notes_ko: Release notes in Korean (optional).
         release_notes_en: Release notes in English (optional).
+        release_notes_ko: Release notes in Korean (optional).
         status: Release status - "draft" for unpublished apps, "completed" for
                 published apps. Default is "draft".
 
@@ -161,12 +325,10 @@ def deploy_internal(
     if not os.path.exists(aab_path):
         raise ValueError(f"AAB file not found: {aab_path}")
 
-    # 1. Create edit
     edit = service.edits().insert(packageName=package_name, body={}).execute()
     edit_id = edit["id"]
 
     try:
-        # 2. Upload bundle
         media = MediaFileUpload(aab_path, mimetype="application/octet-stream")
         bundle = service.edits().bundles().upload(
             packageName=package_name,
@@ -175,12 +337,11 @@ def deploy_internal(
         ).execute()
         version_code = bundle["versionCode"]
 
-        # 3. Set track
         release_notes = []
-        if release_notes_ko:
-            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
         if release_notes_en:
             release_notes.append({"language": "en-US", "text": release_notes_en})
+        if release_notes_ko:
+            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
 
         track_body = {
             "track": "internal",
@@ -199,7 +360,6 @@ def deploy_internal(
             body=track_body,
         ).execute()
 
-        # 4. Commit
         service.edits().commit(packageName=package_name, editId=edit_id).execute()
 
         return (
@@ -210,7 +370,6 @@ def deploy_internal(
         )
 
     except Exception as e:
-        # Delete edit on failure
         try:
             service.edits().delete(packageName=package_name, editId=edit_id).execute()
         except Exception:
@@ -222,20 +381,18 @@ def deploy_internal(
 def deploy_track(
     aab_path: str,
     track: str = "internal",
-    release_notes_ko: str = "",
     release_notes_en: str = "",
+    release_notes_ko: str = "",
     status: str = "draft",
 ) -> str:
     """Deploy an Android App Bundle to any testing track.
 
     Args:
         aab_path: Path to the .aab file to upload.
-        track: Target track - "internal", "alpha" (closed testing),
-               "beta" (open testing), or "production".
-        release_notes_ko: Release notes in Korean (optional).
+        track: Target track - "internal", "alpha", "beta", or "production".
         release_notes_en: Release notes in English (optional).
-        status: Release status - "draft" for unpublished apps, "completed" for
-                published apps. Default is "draft".
+        release_notes_ko: Release notes in Korean (optional).
+        status: Release status - "draft" or "completed". Default is "draft".
 
     Returns:
         A message indicating success with version code and edit ID.
@@ -270,10 +427,10 @@ def deploy_track(
         version_code = bundle["versionCode"]
 
         release_notes = []
-        if release_notes_ko:
-            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
         if release_notes_en:
             release_notes.append({"language": "en-US", "text": release_notes_en})
+        if release_notes_ko:
+            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
 
         track_body = {
             "track": track,
@@ -312,24 +469,20 @@ def deploy_track(
 @mcp.tool()
 def deploy_production(
     aab_path: str,
-    release_notes_ko: str = "",
     release_notes_en: str = "",
+    release_notes_ko: str = "",
     status: str = "completed",
 ) -> str:
     """Deploy an Android App Bundle to the PRODUCTION track.
 
-    CRITICAL: You MUST ask for explicit user confirmation before calling this
-    tool. Production deployment publishes the app to ALL users on Google Play
-    and is difficult to reverse. Always show the user the version, release
-    notes, and status before proceeding, and wait for their approval.
+    CRITICAL: You MUST ask for explicit user confirmation before calling this.
+    Production deployment publishes the app to ALL users on Google Play.
 
     Args:
         aab_path: Path to the .aab file to upload.
-        release_notes_ko: Release notes in Korean (optional).
         release_notes_en: Release notes in English (optional).
-        status: Release status - "completed" to publish immediately,
-                "halted" to pause rollout, "inProgress" for staged rollout.
-                Default is "completed".
+        release_notes_ko: Release notes in Korean (optional).
+        status: Release status - "completed", "halted", or "inProgress".
 
     Returns:
         A message indicating success with version code and edit ID.
@@ -353,10 +506,10 @@ def deploy_production(
         version_code = bundle["versionCode"]
 
         release_notes = []
-        if release_notes_ko:
-            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
         if release_notes_en:
             release_notes.append({"language": "en-US", "text": release_notes_en})
+        if release_notes_ko:
+            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
 
         release = {
             "versionCodes": [str(version_code)],
@@ -395,6 +548,54 @@ def deploy_production(
 
 
 @mcp.tool()
+def get_app_info() -> str:
+    """Get basic app information from Google Play.
+
+    Returns:
+        App details including current version and track information.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        tracks_result = service.edits().tracks().list(
+            packageName=package_name,
+            editId=edit_id,
+        ).execute()
+
+        output = [f"Package: {package_name}\n", "Tracks:"]
+
+        for track in tracks_result.get("tracks", []):
+            track_name = track.get("track", "unknown")
+            releases = track.get("releases", [])
+            if releases:
+                latest = releases[0]
+                version_codes = latest.get("versionCodes", [])
+                status = latest.get("status", "unknown")
+                output.append(
+                    f"  - {track_name}: version {version_codes}, status: {status}"
+                )
+            else:
+                output.append(f"  - {track_name}: no releases")
+
+        return "\n".join(output)
+
+    finally:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# One-time products
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
 def create_inapp_product(
     sku: str,
     localizations: str,
@@ -402,10 +603,11 @@ def create_inapp_product(
     currency_code: str = "USD",
     purchase_option_id: str = "default",
 ) -> str:
-    """Create or update an in-app product (managed product).
+    """Create or update a one-time in-app product.
 
-    Uses the new monetization API with automatic regional price conversion.
-    If the product already exists, it will be updated.
+    Sets explicit regional prices for ALL regions (170+), with automatic
+    capping for regions with price limits (e.g., KR max 570,000 KRW).
+    Does NOT use newRegionsConfig to avoid derived-price validation issues.
 
     IMPORTANT: The app must have BILLING permission and Play Billing Library
     in an uploaded bundle before products can be created.
@@ -414,46 +616,25 @@ def create_inapp_product(
         sku: Product ID (e.g., "rezi_until_exam"). Only lowercase, numbers, underscores.
         localizations: JSON array of localizations. Each entry needs "language", "title", "description".
             Example: [{"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
-                       {"language": "ro", "title": "Rezidențiat", "description": "Acces complet"}]
-        price: Price amount in the specified currency (e.g., 1670 for 1670 RON).
+                       {"language": "ro", "title": "Rezidentiat", "description": "Acces complet"}]
+        price: Price amount in the specified currency (e.g., 1660 for 1660 RON).
         currency_code: ISO currency code (e.g., "RON", "USD", "EUR", "TRY"). Default "USD".
         purchase_option_id: Purchase option ID. Default "default".
 
     Returns:
-        A message indicating success with product details.
+        Product details including key regional prices for verification.
     """
     service = _get_service()
     package_name = _get_package_name()
 
-    price_micros = int(price * 1_000_000)
+    # Convert to all regional prices
+    info = _convert_prices(service, package_name, price, currency_code)
+    regions_version = info["regionsVersion"]
 
-    # Convert prices
-    converted = _convert_region_prices(service, package_name, price_micros, currency_code)
-    regions_version = converted["regionVersion"]["version"]
+    # Build explicit per-region configs with capping
+    regional_configs, cap_warnings = _build_regional_configs(info["convertedRegionPrices"])
 
-    # Build regional configs
-    regional_configs = []
-    for region_code, price_data in converted["convertedRegionPrices"].items():
-        p = price_data["price"]
-        regional_configs.append({
-            "regionCode": region_code,
-            "price": {
-                "currencyCode": p["currencyCode"],
-                "units": p.get("units", "0"),
-                "nanos": p.get("nanos", 0),
-            },
-            "availability": "AVAILABLE",
-        })
-
-    # New regions config
-    other = converted.get("convertedOtherRegionsPrice", {})
-    new_regions_config = {
-        "availability": "AVAILABLE",
-        "usdPrice": other.get("usdPrice"),
-        "eurPrice": other.get("eurPrice"),
-    }
-
-    # Listings from localizations JSON
+    # Parse localizations
     locales = json.loads(localizations)
     listings = [
         {"languageCode": loc["language"], "title": loc["title"], "description": loc["description"]}
@@ -468,11 +649,11 @@ def create_inapp_product(
             "purchaseOptionId": purchase_option_id,
             "buyOption": {"legacyCompatible": True},
             "regionalPricingAndAvailabilityConfigs": regional_configs,
-            "newRegionsConfig": new_regions_config,
+            # No newRegionsConfig — all regions have explicit prices.
+            # New regions Google adds later won't auto-get this product.
         }],
     }
 
-    # Patch with allowMissing=True for upsert behavior
     request = service.monetization().onetimeproducts().patch(
         packageName=package_name,
         productId=sku,
@@ -481,20 +662,34 @@ def create_inapp_product(
         updateMask="listings,purchaseOptions",
     )
 
-    # Add regionsVersion.version parameter manually
+    # Add regionsVersion parameter
     sep = "&" if "?" in request.uri else "?"
     request.uri += f"{sep}regionsVersion.version={regions_version}"
 
     result = request.execute()
 
-    return (
-        f"Successfully created/updated in-app product.\n"
-        f"SKU: {sku}\n"
-        f"Price: {price} {currency_code}\n"
-        f"Localizations: {len(listings)}\n"
-        f"Regions: {len(regional_configs)}\n"
-        f"Status: Product is in DRAFT state. Use activate_inapp_product to activate."
-    )
+    # Build verification output
+    target_region = _CURRENCY_TO_REGION.get(currency_code)
+    price_verification = _extract_verification_prices(result, target_region)
+
+    output = [
+        f"Successfully created/updated one-time product: {sku}",
+        f"Base price: {price:,.2f} {currency_code}",
+        f"Localizations: {len(listings)}",
+        f"Regions: {len(regional_configs)}",
+    ]
+
+    if cap_warnings:
+        output.append(f"Price caps applied ({len(cap_warnings)}):")
+        output.extend(cap_warnings)
+
+    if price_verification:
+        output.append("Verification prices:")
+        output.append(price_verification)
+
+    output.append("Status: DRAFT — use activate_inapp_product to activate.")
+
+    return "\n".join(output)
 
 
 @mcp.tool()
@@ -564,7 +759,7 @@ def list_inapp_products() -> str:
     """List all one-time in-app products for the app.
 
     Returns:
-        JSON formatted list of all in-app products with their details.
+        List of all in-app products with their details.
     """
     service = _get_service()
     package_name = _get_package_name()
@@ -591,7 +786,6 @@ def list_inapp_products() -> str:
         if title == "No title" and listings:
             title = listings[0].get("title", title)
 
-        # Get purchase options for status
         options = product.get("purchaseOptions", [])
         status = "UNKNOWN"
         price_info = ""
@@ -601,11 +795,7 @@ def list_inapp_products() -> str:
             configs = opt.get("regionalPricingAndAvailabilityConfigs", [])
             for cfg in configs:
                 if cfg.get("regionCode") == "US":
-                    price = cfg.get("price", {})
-                    units = price.get("units", "0")
-                    nanos = price.get("nanos", 0)
-                    price_val = int(units) + nanos / 1_000_000_000
-                    price_info = f"${price_val:.2f} USD"
+                    price_info = _format_money(cfg.get("price", {}))
                     break
 
         output.append(f"- {product_id}: {title} ({price_info}) [{status}]")
@@ -614,11 +804,131 @@ def list_inapp_products() -> str:
 
 
 @mcp.tool()
+def batch_create_inapp_products(products_json: str) -> str:
+    """Create multiple one-time in-app products from a JSON array.
+
+    Each product needs: sku, localizations, price, currency_code.
+    Optionally: purchase_option_id (default: "default").
+
+    Args:
+        products_json: JSON array of product definitions.
+            Example: [
+              {"sku": "rezi_until_exam", "price": 1660, "currency_code": "RON",
+               "localizations": [
+                 {"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
+                 {"language": "ro", "title": "Rezidentiat", "description": "Acces complet"}
+               ]}
+            ]
+
+    Returns:
+        Summary of results for each product.
+    """
+    products = json.loads(products_json)
+    results = []
+
+    for i, product in enumerate(products, 1):
+        try:
+            service = _get_service()
+            package_name = _get_package_name()
+
+            sku = product["sku"]
+            prod_price = product["price"]
+            prod_currency = product.get("currency_code", "USD")
+
+            info = _convert_prices(service, package_name, prod_price, prod_currency)
+            regions_version = info["regionsVersion"]
+
+            regional_configs, cap_warnings = _build_regional_configs(info["convertedRegionPrices"])
+
+            listings = [
+                {"languageCode": loc["language"], "title": loc["title"], "description": loc["description"]}
+                for loc in product["localizations"]
+            ]
+
+            opt_id = product.get("purchase_option_id", "default")
+
+            body = {
+                "packageName": package_name,
+                "productId": sku,
+                "listings": listings,
+                "purchaseOptions": [{
+                    "purchaseOptionId": opt_id,
+                    "buyOption": {"legacyCompatible": True},
+                    "regionalPricingAndAvailabilityConfigs": regional_configs,
+                }],
+            }
+
+            request = service.monetization().onetimeproducts().patch(
+                packageName=package_name,
+                productId=sku,
+                body=body,
+                allowMissing=True,
+                updateMask="listings,purchaseOptions",
+            )
+            sep = "&" if "?" in request.uri else "?"
+            request.uri += f"{sep}regionsVersion.version={regions_version}"
+            request.execute()
+
+            caps = f" (capped: {len(cap_warnings)})" if cap_warnings else ""
+            results.append(f"[{i}/{len(products)}] OK: {sku} ({prod_price} {prod_currency}){caps}")
+
+        except Exception as e:
+            results.append(f"[{i}/{len(products)}] FAIL: {product.get('sku', 'unknown')} - {e}")
+
+    return "\n".join(results)
+
+
+@mcp.tool()
+def batch_activate_inapp_products(skus_json: str) -> str:
+    """Activate multiple in-app products.
+
+    Args:
+        skus_json: JSON array of product IDs to activate.
+            Example: ["rezi_until_exam", "bac_until_exam"]
+
+    Returns:
+        Summary of results for each product.
+    """
+    skus = json.loads(skus_json)
+    service = _get_service()
+    package_name = _get_package_name()
+    results = []
+
+    for i, sku in enumerate(skus, 1):
+        try:
+            service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
+                packageName=package_name,
+                productId=sku,
+                body={
+                    "requests": [{
+                        "activatePurchaseOptionRequest": {
+                            "packageName": package_name,
+                            "productId": sku,
+                            "purchaseOptionId": "default",
+                        }
+                    }]
+                },
+            ).execute()
+
+            results.append(f"[{i}/{len(skus)}] OK: {sku} activated")
+
+        except Exception as e:
+            results.append(f"[{i}/{len(skus)}] FAIL: {sku} - {e}")
+
+    return "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
 def list_subscriptions() -> str:
     """List all subscription products for the app.
 
     Returns:
-        JSON formatted list of all subscription products.
+        List of all subscription products.
     """
     service = _get_service()
     package_name = _get_package_name()
@@ -642,8 +952,13 @@ def list_subscriptions() -> str:
             if listing.get("languageCode") == "en-US":
                 title = listing.get("title", title)
                 break
+        if title == "No title" and listings:
+            title = listings[0].get("title", title)
 
-        output.append(f"- {product_id}: {title}")
+        base_plans = sub.get("basePlans", [])
+        plan_ids = [p.get("basePlanId", "?") for p in base_plans]
+
+        output.append(f"- {product_id}: {title} (plans: {', '.join(plan_ids)})")
 
     return "\n".join(output)
 
@@ -657,25 +972,27 @@ def create_subscription(
 ) -> str:
     """Create a subscription product with base plans.
 
-    Creates the subscription, its base plans (in DRAFT state), and regional pricing.
-    After creation, use activate_base_plan to make each base plan available.
+    Creates the subscription with base plans in DRAFT state. Sets explicit
+    regional prices for all regions with automatic capping.
+    Use activate_base_plan to make each base plan available.
 
     Args:
         product_id: Subscription product ID (e.g., "rezi"). Lowercase, numbers, underscores.
-        localizations: JSON array of listings. Each needs "language", "title", and optionally "benefits" (array of up to 4 strings) and "description" (max 80 chars).
+        localizations: JSON array of listings. Each needs "language", "title", and optionally
+            "benefits" (array of up to 4 strings) and "description" (max 80 chars).
             Example: [{"language": "en-US", "title": "Rezi", "benefits": ["Full access"]},
-                       {"language": "ro", "title": "Rezidențiat", "benefits": ["Acces complet"]}]
+                       {"language": "ro", "title": "Rezidentiat", "benefits": ["Acces complet"]}]
         base_plans: JSON array of base plan definitions. Each needs:
             - "id": base plan ID (e.g., "weekly", "monthly")
             - "period": ISO 8601 duration (P1W, P1M, P3M, P6M, P1Y)
             - "price": price amount in the specified currency
             - "currency_code": ISO currency code (e.g., "RON", "EUR", "TRY")
-            - "legacy_compatible" (optional, bool): set true on ONE plan for older billing library compat
+            - "legacy_compatible" (optional, bool): set true on ONE plan
             Example: [{"id": "monthly", "period": "P1M", "price": 210, "currency_code": "RON", "legacy_compatible": true}]
-        tax_category: Tax category. Default "SOFTWARE". Use "SOFTWARE" for digital app sales.
+        tax_category: Tax category. Default "SOFTWARE".
 
     Returns:
-        A message indicating success with subscription details.
+        Subscription details including prices for verification.
     """
     service = _get_service()
     package_name = _get_package_name()
@@ -696,38 +1013,21 @@ def create_subscription(
     # Build base plans with regional pricing
     base_plan_objects = []
     regions_version = None
+    all_cap_warnings = []
 
     for plan in plans:
-        price_micros = int(plan["price"] * 1_000_000)
-        currency_code = plan.get("currency_code", "USD")
+        plan_currency = plan.get("currency_code", "USD")
 
-        converted = _convert_region_prices(service, package_name, price_micros, currency_code)
-        regions_version = converted["regionVersion"]["version"]
+        info = _convert_prices(service, package_name, plan["price"], plan_currency)
+        regions_version = info["regionsVersion"]
 
-        regional_configs = []
-        for region_code, price_data in converted["convertedRegionPrices"].items():
-            p = price_data["price"]
-            regional_configs.append({
-                "regionCode": region_code,
-                "newSubscriberAvailability": True,
-                "price": {
-                    "currencyCode": p["currencyCode"],
-                    "units": p.get("units", "0"),
-                    "nanos": p.get("nanos", 0),
-                },
-            })
-
-        other = converted.get("convertedOtherRegionsPrice", {})
-        other_regions_config = {
-            "usdPrice": other.get("usdPrice"),
-            "eurPrice": other.get("eurPrice"),
-            "newSubscriberAvailability": True,
-        }
+        regional_configs, cap_warnings = _build_subscription_regional_configs(info["convertedRegionPrices"])
+        all_cap_warnings.extend(cap_warnings)
 
         base_plan = {
             "basePlanId": plan["id"],
             "regionalConfigs": regional_configs,
-            "otherRegionsConfig": other_regions_config,
+            # No otherRegionsConfig — all regions have explicit prices.
             "autoRenewingBasePlanType": {
                 "billingPeriodDuration": plan["period"],
                 "resubscribeState": "RESUBSCRIBE_STATE_ACTIVE",
@@ -750,35 +1050,49 @@ def create_subscription(
         },
     }
 
-    result = service.monetization().subscriptions().create(
+    request = service.monetization().subscriptions().create(
         packageName=package_name,
         productId=product_id,
         body=body,
-        **({f"regionsVersion.version": regions_version} if regions_version else {}),
-    ).execute()
-
-    plan_ids = [p["id"] for p in plans]
-    return (
-        f"Successfully created subscription.\n"
-        f"Product ID: {product_id}\n"
-        f"Listings: {len(listings)}\n"
-        f"Base plans (DRAFT): {', '.join(plan_ids)}\n"
-        f"Use activate_base_plan to activate each base plan."
     )
+    if regions_version:
+        sep = "&" if "?" in request.uri else "?"
+        request.uri += f"{sep}regionsVersion.version={regions_version}"
+    result = request.execute()
+
+    plan_summaries = [f"{p['id']} ({p['price']} {p.get('currency_code', 'USD')}, {p['period']})" for p in plans]
+
+    output = [
+        f"Successfully created subscription: {product_id}",
+        f"Listings: {len(listings)}",
+        f"Base plans (DRAFT): {', '.join(plan_summaries)}",
+    ]
+
+    if all_cap_warnings:
+        output.append(f"Price caps applied ({len(all_cap_warnings)}):")
+        output.extend(all_cap_warnings)
+
+    target_region = _CURRENCY_TO_REGION.get(plans[0].get("currency_code", "USD"))
+    verification = _extract_subscription_verification(result, target_region)
+    if verification:
+        output.append("Verification prices:")
+        output.append(verification)
+
+    output.append("Use activate_base_plan to activate each base plan.")
+
+    return "\n".join(output)
 
 
 @mcp.tool()
 def update_subscription(
     product_id: str,
     localizations: str = "",
-    tax_category: str = "",
 ) -> str:
-    """Update an existing subscription's listings or settings.
+    """Update an existing subscription's listings.
 
     Args:
         product_id: Subscription product ID (e.g., "rezi").
-        localizations: JSON array of listings to update (same format as create_subscription). Leave empty to skip.
-        tax_category: Tax category to set. Leave empty to skip.
+        localizations: JSON array of listings to update (same format as create_subscription).
 
     Returns:
         A message indicating success.
@@ -786,53 +1100,47 @@ def update_subscription(
     service = _get_service()
     package_name = _get_package_name()
 
-    update_fields = []
+    if not localizations:
+        return "Nothing to update. Provide localizations to update."
+
+    locales = json.loads(localizations)
+    listings = []
+    for loc in locales:
+        listing = {"languageCode": loc["language"], "title": loc["title"]}
+        if "benefits" in loc:
+            listing["benefits"] = loc["benefits"]
+        if "description" in loc:
+            listing["description"] = loc["description"]
+        listings.append(listing)
+
     body = {
         "packageName": package_name,
         "productId": product_id,
+        "listings": listings,
     }
 
-    if localizations:
-        locales = json.loads(localizations)
-        listings = []
-        for loc in locales:
-            listing = {"languageCode": loc["language"], "title": loc["title"]}
-            if "benefits" in loc:
-                listing["benefits"] = loc["benefits"]
-            if "description" in loc:
-                listing["description"] = loc["description"]
-            listings.append(listing)
-        body["listings"] = listings
-        update_fields.append("listings")
+    # Get regions version (required for patch)
+    info = _convert_prices(service, package_name, 1.0, "USD")
+    regions_version = info["regionsVersion"]
 
-    if not update_fields:
-        return "Nothing to update. Provide localizations to update."
-
-    # Get regions version
-    converted = _convert_region_prices(service, package_name, 1_000_000, "USD")
-    regions_version = converted["regionVersion"]["version"]
-
-    result = service.monetization().subscriptions().patch(
+    request = service.monetization().subscriptions().patch(
         packageName=package_name,
         productId=product_id,
         body=body,
-        updateMask=",".join(update_fields),
-        **({f"regionsVersion.version": regions_version}),
-    ).execute()
-
-    return (
-        f"Successfully updated subscription '{product_id}'.\n"
-        f"Updated fields: {', '.join(update_fields)}"
+        updateMask="listings",
     )
+    sep = "&" if "?" in request.uri else "?"
+    request.uri += f"{sep}regionsVersion.version={regions_version}"
+    request.execute()
+
+    return f"Successfully updated subscription '{product_id}' listings ({len(listings)} locales)."
 
 
 @mcp.tool()
 def delete_subscription(product_id: str) -> str:
     """Delete a subscription product.
 
-    WARNING: This permanently deletes the subscription. Only works if the subscription
-    has never had any subscribers. Once a subscription has had subscribers, it cannot
-    be deleted — only archived/deactivated.
+    WARNING: Only works if the subscription has never had any subscribers.
 
     Args:
         product_id: Subscription product ID to delete (e.g., "rezi").
@@ -911,12 +1219,13 @@ def create_free_trial_offer(
     """Create a free trial offer on a base plan.
 
     Creates the offer in DRAFT state. Use activate_offer to make it live.
+    The trial is available in all regions where the base plan is available.
 
     Args:
         product_id: Parent subscription product ID (e.g., "rezi").
         base_plan_id: Base plan ID to attach the offer to (e.g., "monthly").
         offer_id: Unique offer ID (e.g., "monthly-free-trial").
-        free_trial_duration: ISO 8601 duration for the free trial (e.g., "P3D" for 3 days, "P7D" for 7 days).
+        free_trial_duration: ISO 8601 duration (e.g., "P3D" for 3 days, "P7D" for 7 days).
 
     Returns:
         A message indicating success.
@@ -924,17 +1233,10 @@ def create_free_trial_offer(
     service = _get_service()
     package_name = _get_package_name()
 
-    # Get regions version
-    converted = _convert_region_prices(service, package_name, 1_000_000, "USD")
-    regions_version = converted["regionVersion"]["version"]
-
-    # Build regional configs — make available in all regions
-    regional_configs = []
-    for region_code in converted["convertedRegionPrices"]:
-        regional_configs.append({
-            "regionCode": region_code,
-            "newSubscriberAvailability": True,
-        })
+    # Get all region codes from a price conversion call
+    info = _convert_prices(service, package_name, 1.0, "USD")
+    regions_version = info["regionsVersion"]
+    all_regions = list(info["convertedRegionPrices"].keys())
 
     body = {
         "packageName": package_name,
@@ -945,33 +1247,37 @@ def create_free_trial_offer(
             "duration": free_trial_duration,
             "recurrenceCount": 1,
             "regionalConfigs": [
-                {"regionCode": rc["regionCode"], "free": {}}
-                for rc in regional_configs
+                {"regionCode": rc, "free": {}}
+                for rc in all_regions
             ],
-            "otherRegionsConfig": {"otherRegionsNewSubscriberAvailability": True, "free": {}},
         }],
         "targeting": {
             "acquisitionRule": {
                 "scope": {"thisSubscription": {}},
             },
         },
-        "regionalConfigs": regional_configs,
-        "otherRegionsConfig": {"otherRegionsNewSubscriberAvailability": True},
+        "regionalConfigs": [
+            {"regionCode": rc, "newSubscriberAvailability": True}
+            for rc in all_regions
+        ],
     }
 
-    result = service.monetization().subscriptions().basePlans().offers().create(
+    request = service.monetization().subscriptions().basePlans().offers().create(
         packageName=package_name,
         productId=product_id,
         basePlanId=base_plan_id,
         offerId=offer_id,
         body=body,
-        **({f"regionsVersion.version": regions_version}),
-    ).execute()
+    )
+    sep = "&" if "?" in request.uri else "?"
+    request.uri += f"{sep}regionsVersion.version={regions_version}"
+    request.execute()
 
     return (
         f"Successfully created free trial offer.\n"
         f"Subscription: {product_id}, Base plan: {base_plan_id}\n"
         f"Offer ID: {offer_id}, Duration: {free_trial_duration}\n"
+        f"Regions: {len(all_regions)}\n"
         f"Eligibility: Never had this subscription\n"
         f"Status: DRAFT — use activate_offer to make it live."
     )
@@ -1029,156 +1335,17 @@ def deactivate_offer(product_id: str, base_plan_id: str, offer_id: str) -> str:
     return f"Successfully deactivated offer '{offer_id}' on {product_id}/{base_plan_id}."
 
 
-@mcp.tool()
-def get_app_info() -> str:
-    """Get basic app information from Google Play.
-
-    Returns:
-        App details including current version and track information.
-    """
-    service = _get_service()
-    package_name = _get_package_name()
-
-    # Create a read-only edit to query app info
-    edit = service.edits().insert(packageName=package_name, body={}).execute()
-    edit_id = edit["id"]
-
-    try:
-        # Get track info
-        tracks_result = service.edits().tracks().list(
-            packageName=package_name,
-            editId=edit_id,
-        ).execute()
-
-        output = [f"Package: {package_name}\n", "Tracks:"]
-
-        for track in tracks_result.get("tracks", []):
-            track_name = track.get("track", "unknown")
-            releases = track.get("releases", [])
-            if releases:
-                latest = releases[0]
-                version_codes = latest.get("versionCodes", [])
-                status = latest.get("status", "unknown")
-                output.append(
-                    f"  - {track_name}: version {version_codes}, status: {status}"
-                )
-            else:
-                output.append(f"  - {track_name}: no releases")
-
-        return "\n".join(output)
-
-    finally:
-        # Delete the edit
-        try:
-            service.edits().delete(packageName=package_name, editId=edit_id).execute()
-        except Exception:
-            pass
+# ---------------------------------------------------------------------------
+# Store listing
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-def batch_create_inapp_products(products_json: str) -> str:
-    """Create multiple in-app products from a JSON array.
-
-    Each product in the array should have: sku, localizations, price, currency_code.
-    Optionally: purchase_option_id (default: "default").
-
-    IMPORTANT: The app must have BILLING permission and Play Billing Library
-    in an uploaded bundle before products can be created.
-
-    Args:
-        products_json: JSON array of product definitions.
-            Example: [
-              {"sku": "rezi_until_exam", "price": 1670, "currency_code": "RON",
-               "localizations": [
-                 {"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
-                 {"language": "ro", "title": "Rezidențiat", "description": "Acces complet"}
-               ]},
-              ...
-            ]
-
-    Returns:
-        Summary of results for each product.
-    """
-    products = json.loads(products_json)
-    results = []
-
-    for i, product in enumerate(products, 1):
-        try:
-            service = _get_service()
-            package_name = _get_package_name()
-
-            sku = product["sku"]
-            prod_price = product["price"]
-            prod_currency = product.get("currency_code", "USD")
-            price_micros = int(prod_price * 1_000_000)
-
-            converted = _convert_region_prices(service, package_name, price_micros, prod_currency)
-            regions_version = converted["regionVersion"]["version"]
-
-            regional_configs = []
-            for region_code, price_data in converted["convertedRegionPrices"].items():
-                p = price_data["price"]
-                regional_configs.append({
-                    "regionCode": region_code,
-                    "price": {
-                        "currencyCode": p["currencyCode"],
-                        "units": p.get("units", "0"),
-                        "nanos": p.get("nanos", 0),
-                    },
-                    "availability": "AVAILABLE",
-                })
-
-            other = converted.get("convertedOtherRegionsPrice", {})
-            new_regions_config = {
-                "availability": "AVAILABLE",
-                "usdPrice": other.get("usdPrice"),
-                "eurPrice": other.get("eurPrice"),
-            }
-
-            listings = [
-                {"languageCode": loc["language"], "title": loc["title"], "description": loc["description"]}
-                for loc in product["localizations"]
-            ]
-
-            opt_id = product.get("purchase_option_id", "default")
-
-            body = {
-                "packageName": package_name,
-                "productId": sku,
-                "listings": listings,
-                "purchaseOptions": [{
-                    "purchaseOptionId": opt_id,
-                    "buyOption": {"legacyCompatible": True},
-                    "regionalPricingAndAvailabilityConfigs": regional_configs,
-                    "newRegionsConfig": new_regions_config,
-                }],
-            }
-
-            request = service.monetization().onetimeproducts().patch(
-                packageName=package_name,
-                productId=sku,
-                body=body,
-                allowMissing=True,
-                updateMask="listings,purchaseOptions",
-            )
-            sep = "&" if "?" in request.uri else "?"
-            request.uri += f"{sep}regionsVersion.version={regions_version}"
-            request.execute()
-
-            results.append(f"[{i}/{len(products)}] OK: {sku} ({prod_price} {prod_currency})")
-
-        except Exception as e:
-            results.append(f"[{i}/{len(products)}] FAIL: {product.get('sku', 'unknown')} - {e}")
-
-    return "\n".join(results)
-
-
-@mcp.tool()
-def get_store_listing(language: str = "ko-KR") -> str:
+def get_store_listing(language: str = "en-US") -> str:
     """Get current store listing for the app.
 
     Args:
-        language: Language code (e.g., "ko-KR", "en-US"). Default is "ko-KR".
+        language: Language code (e.g., "en-US", "ro", "tr"). Default is "en-US".
 
     Returns:
         Current store listing information.
@@ -1225,7 +1392,7 @@ def update_store_listing(
     """Update store listing for the app.
 
     Args:
-        language: Language code (e.g., "ko-KR", "en-US").
+        language: Language code (e.g., "en-US", "ro", "tr").
         title: App title (max 30 characters). Leave empty to keep current.
         short_description: Short description (max 80 characters). Leave empty to keep current.
         full_description: Full description (max 4000 characters). Leave empty to keep current.
@@ -1240,7 +1407,6 @@ def update_store_listing(
     edit_id = edit["id"]
 
     try:
-        # Get current listing first
         try:
             current = service.edits().listings().get(
                 packageName=package_name,
@@ -1250,7 +1416,6 @@ def update_store_listing(
         except Exception:
             current = {}
 
-        # Build update body, keeping current values if not provided
         body = {
             "language": language,
             "title": title if title else current.get("title", ""),
@@ -1265,7 +1430,6 @@ def update_store_listing(
             body=body,
         ).execute()
 
-        # Commit the edit (handles draft app requirements)
         _commit_edit(service, package_name, edit_id)
 
         return (
@@ -1287,28 +1451,16 @@ def update_store_listing(
 def upload_store_image(
     image_path: str,
     image_type: str,
-    language: str = "ko-KR",
+    language: str = "en-US",
 ) -> str:
     """Upload an image to the store listing.
 
     Args:
         image_path: Path to the image file (PNG or JPEG).
-        image_type: Type of image. One of:
-            - "icon": App icon (512x512 PNG, 1 required)
-            - "featureGraphic": Feature graphic (1024x500, 1 required)
-            - "phoneScreenshots": Phone screenshot (8 required, min 320px,
-              max 3840px per side, aspect ratio max 2:1,
-              recommended 1080x2340 portrait)
-            - "sevenInchScreenshots": 7-inch tablet screenshot (up to 8,
-              recommended 1200x1920 portrait)
-            - "tenInchScreenshots": 10-inch tablet screenshot (up to 8,
-              recommended 1600x2560 portrait)
-            - "tvBanner": TV banner (1280x720)
-            - "tvScreenshots": TV screenshot
-            - "wearScreenshots": Wear OS screenshot
-        language: Language code (e.g., "ko-KR", "en-US"). Each language
-            needs its own set of screenshots. Icon and featureGraphic are
-            also per-language.
+        image_type: Type of image: "icon", "featureGraphic", "phoneScreenshots",
+            "sevenInchScreenshots", "tenInchScreenshots", "tvBanner",
+            "tvScreenshots", or "wearScreenshots".
+        language: Language code (e.g., "en-US", "ro"). Default is "en-US".
 
     Returns:
         A message indicating success with image details.
@@ -1323,7 +1475,6 @@ def upload_store_image(
     edit_id = edit["id"]
 
     try:
-        # Determine mime type
         ext = os.path.splitext(image_path)[1].lower()
         if ext == ".png":
             mime_type = "image/png"
@@ -1342,7 +1493,6 @@ def upload_store_image(
             media_body=media,
         ).execute()
 
-        # Commit the edit (handles draft app requirements)
         _commit_edit(service, package_name, edit_id)
 
         image_info = result.get("image", {})
@@ -1361,12 +1511,12 @@ def upload_store_image(
 
 
 @mcp.tool()
-def list_store_images(language: str = "ko-KR", image_type: str = "phoneScreenshots") -> str:
+def list_store_images(language: str = "en-US", image_type: str = "phoneScreenshots") -> str:
     """List uploaded images for the store listing.
 
     Args:
-        language: Language code (e.g., "ko-KR", "en-US").
-        image_type: Type of image to list (e.g., "phoneScreenshots", "icon").
+        language: Language code (e.g., "en-US", "ro"). Default is "en-US".
+        image_type: Type of image to list. Default is "phoneScreenshots".
 
     Returns:
         List of uploaded images.
@@ -1409,7 +1559,7 @@ def delete_store_image(image_id: str, language: str, image_type: str) -> str:
 
     Args:
         image_id: ID of the image to delete.
-        language: Language code (e.g., "ko-KR", "en-US").
+        language: Language code (e.g., "en-US", "ro").
         image_type: Type of image (e.g., "phoneScreenshots", "icon").
 
     Returns:
@@ -1430,7 +1580,6 @@ def delete_store_image(image_id: str, language: str, image_type: str) -> str:
             imageId=image_id,
         ).execute()
 
-        # Commit the edit (handles draft app requirements)
         _commit_edit(service, package_name, edit_id)
 
         return f"Successfully deleted {image_type} image {image_id} for {language}."
@@ -1447,33 +1596,16 @@ def delete_store_image(image_id: str, language: str, image_type: str) -> str:
 def batch_upload_store_images(
     directory: str,
     image_type: str,
-    language: str = "ko-KR",
+    language: str = "en-US",
     clear_existing: bool = False,
 ) -> str:
     """Upload all images from a directory to the store listing in a single edit.
 
-    Much faster than uploading one by one since it uses a single API edit
-    transaction for all images.
-
     Args:
         directory: Path to the directory containing image files (PNG or JPEG).
-            Files are uploaded in alphabetical order.
-        image_type: Type of image. One of:
-            - "icon": App icon (512x512 PNG, only 1 allowed)
-            - "featureGraphic": Feature graphic (1024x500, only 1 allowed)
-            - "phoneScreenshots": Phone screenshots (2-8 images, min 320px,
-              max 3840px, aspect ratio max 2:1)
-            - "sevenInchScreenshots": 7-inch tablet screenshots (up to 8,
-              recommended 1200x1920 portrait)
-            - "tenInchScreenshots": 10-inch tablet screenshots (up to 8,
-              recommended 1600x2560 portrait)
-            - "tvBanner": TV banner (1280x720)
-            - "tvScreenshots": TV screenshots
-            - "wearScreenshots": Wear OS screenshots
-        language: Language code (e.g., "ko-KR", "en-US"). Each language
-            needs its own set of screenshots.
-        clear_existing: If True, delete all existing images of this type
-            before uploading. Default is False.
+        image_type: Type of image (e.g., "phoneScreenshots", "icon").
+        language: Language code (e.g., "en-US", "ro"). Default is "en-US".
+        clear_existing: If True, delete all existing images of this type first.
 
     Returns:
         Summary of upload results.
@@ -1486,7 +1618,6 @@ def batch_upload_store_images(
     if not os.path.isdir(directory):
         raise ValueError(f"Directory not found: {directory}")
 
-    # Find image files
     files = sorted(
         f for f in glob_mod.glob(os.path.join(directory, "*"))
         if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg")
@@ -1501,7 +1632,6 @@ def batch_upload_store_images(
     try:
         results = []
 
-        # Optionally clear existing images
         if clear_existing:
             try:
                 existing = service.edits().images().list(
@@ -1522,7 +1652,6 @@ def batch_upload_store_images(
             except Exception:
                 pass
 
-        # Upload all images
         for i, filepath in enumerate(files, 1):
             ext = os.path.splitext(filepath)[1].lower()
             mime = "image/png" if ext == ".png" else "image/jpeg"
@@ -1540,7 +1669,6 @@ def batch_upload_store_images(
             filename = os.path.basename(filepath)
             results.append(f"[{i}/{len(files)}] Uploaded: {filename} (ID: {img_id})")
 
-        # Commit
         _commit_edit(service, package_name, edit_id)
 
         return "\n".join([
@@ -1561,7 +1689,7 @@ def delete_all_store_images(language: str, image_type: str) -> str:
     """Delete all images of a given type from the store listing.
 
     Args:
-        language: Language code (e.g., "ko-KR", "en-US").
+        language: Language code (e.g., "en-US", "ro").
         image_type: Type of image (e.g., "phoneScreenshots", "icon").
 
     Returns:
@@ -1605,48 +1733,6 @@ def delete_all_store_images(language: str, image_type: str) -> str:
         except Exception:
             pass
         raise e
-
-
-@mcp.tool()
-def batch_activate_inapp_products(skus_json: str) -> str:
-    """Activate multiple in-app products.
-
-    Args:
-        skus_json: JSON array of product IDs to activate.
-            Example: ["gems_12", "gems_66", "gems_136"]
-
-    Returns:
-        Summary of results for each product.
-    """
-    skus = json.loads(skus_json)
-    service = _get_service()
-    package_name = _get_package_name()
-    results = []
-
-    for i, sku in enumerate(skus, 1):
-        try:
-            purchase_option_id = "default"
-
-            service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
-                packageName=package_name,
-                productId=sku,
-                body={
-                    "requests": [{
-                        "activatePurchaseOptionRequest": {
-                            "packageName": package_name,
-                            "productId": sku,
-                            "purchaseOptionId": purchase_option_id,
-                        }
-                    }]
-                },
-            ).execute()
-
-            results.append(f"[{i}/{len(skus)}] OK: {sku} activated")
-
-        except Exception as e:
-            results.append(f"[{i}/{len(skus)}] FAIL: {sku} - {e}")
-
-    return "\n".join(results)
 
 
 if __name__ == "__main__":
