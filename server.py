@@ -113,6 +113,24 @@ _CURRENCY_TO_REGION = {
     "IDR": "ID", "VND": "VN", "UAH": "UA", "BGN": "BG", "HRK": "HR",
 }
 
+# US age rating tiers for in-app products and subscriptions.
+_AGE_RATING_MAP = {
+    "EVERYONE": "PRODUCT_AGE_RATING_TIER_EVERYONE",
+    "13+": "PRODUCT_AGE_RATING_TIER_THIRTEEN_AND_ABOVE",
+    "16+": "PRODUCT_AGE_RATING_TIER_SIXTEEN_AND_ABOVE",
+    "18+": "PRODUCT_AGE_RATING_TIER_EIGHTEEN_AND_ABOVE",
+}
+
+
+def _age_rating_settings(age_rating: str) -> dict:
+    """Build taxAndComplianceSettings with US age rating."""
+    tier = _AGE_RATING_MAP.get(age_rating, _AGE_RATING_MAP["EVERYONE"])
+    return {
+        "regionalProductAgeRatingInfos": [
+            {"regionCode": "US", "productAgeRatingTier": tier},
+        ],
+    }
+
 
 def _price_to_units_nanos(price: float) -> tuple[int, int]:
     """Convert a decimal price to (units, nanos) using Decimal for precision."""
@@ -602,6 +620,7 @@ def create_inapp_product(
     price: float,
     currency_code: str = "USD",
     purchase_option_id: str = "default",
+    age_rating: str = "EVERYONE",
 ) -> str:
     """Create or update a one-time in-app product.
 
@@ -626,6 +645,7 @@ def create_inapp_product(
             This is what the customer pays (same as Google Play Console).
         currency_code: ISO currency code (e.g., "RON", "USD", "EUR", "TRY"). Default "USD".
         purchase_option_id: Purchase option ID. Default "default".
+        age_rating: US age rating. One of "EVERYONE", "13+", "16+", "18+". Default "EVERYONE".
 
     Returns:
         Product details including key regional prices for verification.
@@ -664,6 +684,7 @@ def create_inapp_product(
         "packageName": package_name,
         "productId": sku,
         "listings": listings,
+        "taxAndComplianceSettings": _age_rating_settings(age_rating),
         "purchaseOptions": [{
             "purchaseOptionId": purchase_option_id,
             "buyOption": {"legacyCompatible": True},
@@ -678,7 +699,7 @@ def create_inapp_product(
         productId=sku,
         body=body,
         allowMissing=True,
-        updateMask="listings,purchaseOptions",
+        updateMask="listings,purchaseOptions,taxAndComplianceSettings",
     )
 
     # Add regionsVersion parameter
@@ -827,12 +848,12 @@ def batch_create_inapp_products(products_json: str) -> str:
     """Create multiple one-time in-app products from a JSON array.
 
     Each product needs: sku, localizations, price, currency_code.
-    Optionally: purchase_option_id (default: "default").
+    Optionally: purchase_option_id (default: "default"), age_rating (default: "EVERYONE").
 
     Args:
         products_json: JSON array of product definitions.
             Example: [
-              {"sku": "rezi_until_exam", "price": 1660, "currency_code": "RON",
+              {"sku": "rezi_until_exam", "price": 1998, "currency_code": "RON",
                "localizations": [
                  {"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
                  {"language": "ro", "title": "Rezidentiat", "description": "Acces complet"}
@@ -879,10 +900,13 @@ def batch_create_inapp_products(products_json: str) -> str:
 
             opt_id = product.get("purchase_option_id", "default")
 
+            prod_age_rating = product.get("age_rating", "EVERYONE")
+
             body = {
                 "packageName": package_name,
                 "productId": sku,
                 "listings": listings,
+                "taxAndComplianceSettings": _age_rating_settings(prod_age_rating),
                 "purchaseOptions": [{
                     "purchaseOptionId": opt_id,
                     "buyOption": {"legacyCompatible": True},
@@ -895,7 +919,7 @@ def batch_create_inapp_products(products_json: str) -> str:
                 productId=sku,
                 body=body,
                 allowMissing=True,
-                updateMask="listings,purchaseOptions",
+                updateMask="listings,purchaseOptions,taxAndComplianceSettings",
             )
             sep = "&" if "?" in request.uri else "?"
             request.uri += f"{sep}regionsVersion.version={regions_version}"
@@ -1001,6 +1025,7 @@ def create_subscription(
     localizations: str,
     base_plans: str,
     tax_category: str = "SOFTWARE",
+    age_rating: str = "EVERYONE",
 ) -> str:
     """Create a subscription product with base plans.
 
@@ -1022,6 +1047,7 @@ def create_subscription(
             - "legacy_compatible" (optional, bool): set true on ONE plan
             Example: [{"id": "monthly", "period": "P1M", "price": 250, "currency_code": "RON", "legacy_compatible": true}]
         tax_category: Tax category. Default "SOFTWARE".
+        age_rating: US age rating. One of "EVERYONE", "13+", "16+", "18+". Default "EVERYONE".
 
     Returns:
         Subscription details including prices for verification.
@@ -1092,6 +1118,7 @@ def create_subscription(
         "taxAndComplianceSettings": {
             "eeaWithdrawalRightType": "EEA_WITHDRAWAL_RIGHT_TYPE_UNSPECIFIED",
             "taxRateInfoByRegionCode": {},
+            **_age_rating_settings(age_rating),
         },
     }
 
