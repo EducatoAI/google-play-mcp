@@ -192,8 +192,12 @@ def _build_regional_configs(converted_prices: dict) -> tuple[list, list[str]]:
     """
     regional_configs = []
     cap_warnings = []
+    seen_regions = set()
 
     for region_code, price_data in converted_prices.items():
+        if region_code in seen_regions:
+            continue
+        seen_regions.add(region_code)
         p = price_data["price"]
         units = int(p.get("units", "0"))
         nanos = p.get("nanos", 0)
@@ -225,8 +229,12 @@ def _build_subscription_regional_configs(converted_prices: dict) -> tuple[list, 
     """
     regional_configs = []
     cap_warnings = []
+    seen_regions = set()
 
     for region_code, price_data in converted_prices.items():
+        if region_code in seen_regions:
+            continue
+        seen_regions.add(region_code)
         p = price_data["price"]
         units = int(p.get("units", "0"))
         nanos = p.get("nanos", 0)
@@ -1110,13 +1118,15 @@ def create_subscription(
 
         base_plan_objects.append(base_plan)
 
+    # Create with first base plan, then patch to add additional plans
+    # (the API rejects multiple base plans with overlapping regions in create)
     body = {
         "packageName": package_name,
         "productId": product_id,
         "listings": listings,
-        "basePlans": base_plan_objects,
+        "basePlans": [base_plan_objects[0]],
         "taxAndComplianceSettings": {
-            "eeaWithdrawalRightType": "EEA_WITHDRAWAL_RIGHT_TYPE_UNSPECIFIED",
+            "eeaWithdrawalRightType": "WITHDRAWAL_RIGHT_DIGITAL_CONTENT",
             "taxRateInfoByRegionCode": {},
             **_age_rating_settings(age_rating),
         },
@@ -1131,6 +1141,19 @@ def create_subscription(
         sep = "&" if "?" in request.uri else "?"
         request.uri += f"{sep}regionsVersion.version={regions_version}"
     result = request.execute()
+
+    # Add remaining base plans via patch
+    if len(base_plan_objects) > 1:
+        body["basePlans"] = base_plan_objects
+        request = service.monetization().subscriptions().patch(
+            packageName=package_name,
+            productId=product_id,
+            body=body,
+            updateMask="basePlans",
+        )
+        sep = "&" if "?" in request.uri else "?"
+        request.uri += f"{sep}regionsVersion.version={regions_version}"
+        result = request.execute()
 
     plan_summaries = [f"{p['id']} ({p['price']} {p.get('currency_code', 'USD')}, {p['period']})" for p in plans]
 
