@@ -609,6 +609,11 @@ def create_inapp_product(
     capping for regions with price limits (e.g., KR max 570,000 KRW).
     Does NOT use newRegionsConfig to avoid derived-price validation issues.
 
+    The price is the BUYER-FACING price (what the customer pays, including tax).
+    This is the same price you would enter in the Google Play Console.
+    The target region (determined from currency_code) gets this exact price;
+    all other regions get Google's exchange-rate-converted equivalents.
+
     IMPORTANT: The app must have BILLING permission and Play Billing Library
     in an uploaded bundle before products can be created.
 
@@ -617,7 +622,8 @@ def create_inapp_product(
         localizations: JSON array of localizations. Each entry needs "language", "title", "description".
             Example: [{"language": "en-US", "title": "Rezi - Until Exam", "description": "Full access"},
                        {"language": "ro", "title": "Rezidentiat", "description": "Acces complet"}]
-        price: Price amount in the specified currency (e.g., 1660 for 1660 RON).
+        price: Buyer-facing price in the specified currency (e.g., 1998 for 1998 RON).
+            This is what the customer pays (same as Google Play Console).
         currency_code: ISO currency code (e.g., "RON", "USD", "EUR", "TRY"). Default "USD".
         purchase_option_id: Purchase option ID. Default "default".
 
@@ -633,6 +639,19 @@ def create_inapp_product(
 
     # Build explicit per-region configs with capping
     regional_configs, cap_warnings = _build_regional_configs(info["convertedRegionPrices"])
+
+    # Override the target region with the exact user-specified price
+    target_region = _CURRENCY_TO_REGION.get(currency_code)
+    if target_region:
+        exact_units, exact_nanos = _price_to_units_nanos(price)
+        for cfg in regional_configs:
+            if cfg["regionCode"] == target_region:
+                cfg["price"] = {
+                    "currencyCode": currency_code,
+                    "units": str(exact_units),
+                    "nanos": exact_nanos,
+                }
+                break
 
     # Parse localizations
     locales = json.loads(localizations)
@@ -768,7 +787,7 @@ def list_inapp_products() -> str:
         packageName=package_name,
     ).execute()
 
-    products = result.get("onetimeProducts", [])
+    products = result.get("oneTimeProducts", [])
 
     if not products:
         return "No in-app products found."
@@ -839,6 +858,19 @@ def batch_create_inapp_products(products_json: str) -> str:
             regions_version = info["regionsVersion"]
 
             regional_configs, cap_warnings = _build_regional_configs(info["convertedRegionPrices"])
+
+            # Override the target region with the exact user-specified price
+            target_region = _CURRENCY_TO_REGION.get(prod_currency)
+            if target_region:
+                exact_units, exact_nanos = _price_to_units_nanos(prod_price)
+                for cfg in regional_configs:
+                    if cfg["regionCode"] == target_region:
+                        cfg["price"] = {
+                            "currencyCode": prod_currency,
+                            "units": str(exact_units),
+                            "nanos": exact_nanos,
+                        }
+                        break
 
             listings = [
                 {"languageCode": loc["language"], "title": loc["title"], "description": loc["description"]}
@@ -985,10 +1017,10 @@ def create_subscription(
         base_plans: JSON array of base plan definitions. Each needs:
             - "id": base plan ID (e.g., "weekly", "monthly")
             - "period": ISO 8601 duration (P1W, P1M, P3M, P6M, P1Y)
-            - "price": price amount in the specified currency
+            - "price": buyer-facing price (what the customer pays, same as Google Play Console)
             - "currency_code": ISO currency code (e.g., "RON", "EUR", "TRY")
             - "legacy_compatible" (optional, bool): set true on ONE plan
-            Example: [{"id": "monthly", "period": "P1M", "price": 210, "currency_code": "RON", "legacy_compatible": true}]
+            Example: [{"id": "monthly", "period": "P1M", "price": 250, "currency_code": "RON", "legacy_compatible": true}]
         tax_category: Tax category. Default "SOFTWARE".
 
     Returns:
@@ -1023,6 +1055,19 @@ def create_subscription(
 
         regional_configs, cap_warnings = _build_subscription_regional_configs(info["convertedRegionPrices"])
         all_cap_warnings.extend(cap_warnings)
+
+        # Override the target region with the exact user-specified price
+        target_region = _CURRENCY_TO_REGION.get(plan_currency)
+        if target_region:
+            exact_units, exact_nanos = _price_to_units_nanos(plan["price"])
+            for cfg in regional_configs:
+                if cfg["regionCode"] == target_region:
+                    cfg["price"] = {
+                        "currencyCode": plan_currency,
+                        "units": str(exact_units),
+                        "nanos": exact_nanos,
+                    }
+                    break
 
         base_plan = {
             "basePlanId": plan["id"],
