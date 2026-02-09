@@ -1232,6 +1232,109 @@ def update_subscription(
 
 
 @mcp.tool()
+def add_base_plan_to_subscription(
+    product_id: str,
+    base_plan_id: str,
+    period: str,
+    price: float,
+    currency_code: str = "USD",
+) -> str:
+    """Add a new base plan to an existing subscription.
+
+    Creates the base plan in DRAFT state with regional pricing for all regions.
+    Use activate_base_plan to make it available for new subscribers.
+
+    Args:
+        product_id: Subscription product ID (e.g., "medschool").
+        base_plan_id: New base plan ID (e.g., "annual").
+        period: ISO 8601 duration (P1W, P1M, P3M, P6M, P1Y).
+        price: Buyer-facing price (what the customer pays, same as Google Play Console).
+        currency_code: ISO currency code (e.g., "RON", "EUR", "TRY"). Default "USD".
+
+    Returns:
+        Success info with price verification, cap warnings, and DRAFT status note.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    # 1. Get the existing subscription to preserve its base plans
+    existing = service.monetization().subscriptions().get(
+        packageName=package_name,
+        productId=product_id,
+    ).execute()
+
+    existing_plans = existing.get("basePlans", [])
+
+    # 2. Convert the price to all regional prices
+    info = _convert_prices(service, package_name, price, currency_code)
+    regions_version = info["regionsVersion"]
+
+    # 3. Build regional configs with capping
+    regional_configs, cap_warnings = _build_subscription_regional_configs(info["convertedRegionPrices"])
+
+    # 4. Override target region with exact price
+    target_region = _CURRENCY_TO_REGION.get(currency_code)
+    if target_region:
+        exact_units, exact_nanos = _price_to_units_nanos(price)
+        for cfg in regional_configs:
+            if cfg["regionCode"] == target_region:
+                cfg["price"] = {
+                    "currencyCode": currency_code,
+                    "units": str(exact_units),
+                    "nanos": exact_nanos,
+                }
+                break
+
+    # 5. Build the new base plan object
+    new_plan = {
+        "basePlanId": base_plan_id,
+        "regionalConfigs": regional_configs,
+        "autoRenewingBasePlanType": {
+            "billingPeriodDuration": period,
+            "resubscribeState": "RESUBSCRIBE_STATE_ACTIVE",
+        },
+    }
+
+    # 6. Patch the subscription with existing plans + new plan
+    body = {
+        "packageName": package_name,
+        "productId": product_id,
+        "basePlans": existing_plans + [new_plan],
+    }
+
+    request = service.monetization().subscriptions().patch(
+        packageName=package_name,
+        productId=product_id,
+        body=body,
+        updateMask="basePlans",
+    )
+    sep = "&" if "?" in request.uri else "?"
+    request.uri += f"{sep}regionsVersion.version={regions_version}"
+    result = request.execute()
+
+    # Build output
+    output = [
+        f"Successfully added base plan '{base_plan_id}' to subscription '{product_id}'.",
+        f"Period: {period}",
+        f"Price: {price:,.2f} {currency_code}",
+        f"Regions: {len(regional_configs)}",
+    ]
+
+    if cap_warnings:
+        output.append(f"Price caps applied ({len(cap_warnings)}):")
+        output.extend(cap_warnings)
+
+    verification = _extract_subscription_verification(result, target_region)
+    if verification:
+        output.append("Verification prices:")
+        output.append(verification)
+
+    output.append("Status: DRAFT — use activate_base_plan to activate.")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
 def delete_subscription(product_id: str) -> str:
     """Delete a subscription product.
 
